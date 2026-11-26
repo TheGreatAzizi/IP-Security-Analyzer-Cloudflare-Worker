@@ -30,7 +30,7 @@
 
 ## Overview
 
-**IP Security Analyzer** is a single-file Cloudflare Worker that analyzes the public network identity of a visitor. It combines Cloudflare request metadata, IPinfo Lite ASN enrichment, AbuseIPDB reputation data, request-header consistency checks, and a browser-side WebRTC leak test.
+**IP Security Analyzer** is a single-file Cloudflare Worker that analyzes the public network identity of a visitor. It combines Cloudflare request metadata, IPinfo Lite ASN enrichment, optional InternetData enrichment, AbuseIPDB reputation data, request-header consistency checks, and a browser-side WebRTC leak test.
 
 The project is designed to be transparent: it separates **network classification** from **risk scoring**. For example, a datacenter, CDN, cloud, or transit IP is shown as infrastructure, but it is **not penalized by default** unless stronger risk indicators exist, such as abuse reports, Tor status, suspicious automation headers, VPN/proxy naming signals, or WebRTC public IP mismatch.
 
@@ -88,6 +88,18 @@ IPinfo Lite is used to enrich the IP address with:
 
 IPinfo Lite does not provide direct `is_vpn`, `is_proxy`, `is_tor`, or `is_hosting` fields. Because of that, this project does not claim definitive VPN detection from IPinfo Lite alone. It uses Lite data as attribution and context.
 
+### 🌍 InternetData Enrichment
+
+InternetData is an optional second source for network identity. It adds:
+
+- ASN, AS name, and AS domain
+- Company name and domain
+- Network type, such as `hosting`, `isp`, or `education`
+- Reverse-DNS hostname
+- Tor flag
+
+A `hosting` network type is shown as infrastructure only and does not reduce the score. Its Tor flag carries the same penalty as AbuseIPDB's, applied once if both report it.
+
 ### 🧯 AbuseIPDB Reputation Layer
 
 AbuseIPDB adds reputation and abuse context, including:
@@ -137,7 +149,7 @@ The score decreases only for stronger signals such as:
 
 | Signal | Effect |
 |---|---:|
-| Tor flag from AbuseIPDB | High penalty |
+| Tor flag from AbuseIPDB or InternetData | High penalty |
 | High AbuseIPDB confidence score | High penalty |
 | Abuse reports | Low to high penalty depending on report count |
 | VPN/proxy/privacy keyword match | Penalty |
@@ -215,6 +227,10 @@ The goal is not to guess hidden private data. The goal is to evaluate observable
       "enabled": true,
       "ok": true
     },
+    "internetdata": {
+      "enabled": true,
+      "ok": true
+    },
     "abuseipdb": {
       "enabled": true,
       "ok": true
@@ -275,6 +291,16 @@ Create a free IPinfo token and add it as:
 IPINFO_TOKEN
 ```
 
+### InternetData
+
+Create a free InternetData API key in the [console](https://app.internetdata.io) and add it as:
+
+```text
+INTERNETDATA_KEY
+```
+
+With the key set, each visitor IP is sent to InternetData ([terms](https://internetdata.io/terms), [privacy](https://internetdata.io/privacy)).
+
 ### AbuseIPDB
 
 Create an AbuseIPDB API key and add it as:
@@ -295,6 +321,7 @@ Add:
 
 ```text
 IPINFO_TOKEN = your_ipinfo_token
+INTERNETDATA_KEY = your_internetdata_key
 ABUSEIPDB_KEY = your_abuseipdb_key
 ```
 
@@ -304,6 +331,7 @@ If secrets are not available, fill these values at the top of the Worker file:
 
 ```javascript
 const MANUAL_IPINFO_TOKEN = "";
+const MANUAL_INTERNETDATA_KEY = "";
 const MANUAL_ABUSEIPDB_KEY = "";
 ```
 
@@ -351,6 +379,7 @@ This data provides the base network identity.
 The Worker queries external APIs:
 
 - **IPinfo Lite** for ASN and country enrichment
+- **InternetData** for ASN, company, network type, hostname, and Tor flag
 - **AbuseIPDB** for reputation, report count, Tor flag, usage type, and related abuse context
 
 These sources are combined with Cloudflare metadata for better attribution.
@@ -629,10 +658,11 @@ npx wrangler deploy
 
 ## تنظیم کلیدها
 
-برای نتیجه بهتر، این دو کلید را در Cloudflare Worker Secrets قرار دهید:
+برای نتیجه بهتر، این کلیدها را در Cloudflare Worker Secrets قرار دهید:
 
 ```text
 IPINFO_TOKEN
+INTERNETDATA_KEY
 ABUSEIPDB_KEY
 ```
 
@@ -640,6 +670,7 @@ ABUSEIPDB_KEY
 
 ```javascript
 const MANUAL_IPINFO_TOKEN = "";
+const MANUAL_INTERNETDATA_KEY = "";
 const MANUAL_ABUSEIPDB_KEY = "";
 ```
 
