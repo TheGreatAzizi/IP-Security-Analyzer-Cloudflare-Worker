@@ -1,5 +1,6 @@
 const MANUAL_IPINFO_TOKEN = "";
 const MANUAL_ABUSEIPDB_KEY = "";
+const MANUAL_INTERNETDATA_KEY = "";
 
 const APP_VERSION = "9.0.0-professional-no-datacenter-penalty";
 
@@ -318,6 +319,33 @@ async function lookupAbuseIpdb(ip, env) {
   return Object.assign({ enabled: true }, result);
 }
 
+async function lookupInternetData(ip, env) {
+  const key = getToken(env, "INTERNETDATA_KEY", MANUAL_INTERNETDATA_KEY);
+
+  if (!key || !ip || ip === "unknown") {
+    return {
+      enabled: false,
+      ok: false,
+      error: "INTERNETDATA_KEY not configured"
+    };
+  }
+
+  const url = "https://api.internetdata.io/" + encodeURIComponent(ip);
+
+  const result = await safeFetchJson(url, {
+    headers: {
+      "accept": "application/json",
+      "authorization": "Bearer " + key
+    },
+    cf: {
+      cacheTtl: 300,
+      cacheEverything: true
+    }
+  }, 3500);
+
+  return Object.assign({ enabled: true }, result);
+}
+
 function parseIpinfoLite(payload) {
   if (!payload || !payload.ok || !payload.data) return null;
 
@@ -361,13 +389,40 @@ function parseAbuseIpdb(payload) {
   };
 }
 
-function classifyLocal(base, ipinfoLite, abuse) {
+function parseInternetData(payload) {
+  if (!payload || !payload.ok || !payload.data) return null;
+
+  const d = payload.data;
+  const asn = d.asn || {};
+  const company = d.company || {};
+  const location = d.location || {};
+
+  return {
+    ip: d.ip || "",
+    asn: asn.asn ? "AS" + asn.asn : "",
+    asName: asn.name || "",
+    asDomain: asn.domain || "",
+    networkType: asn.type || "",
+    companyName: company.name || "",
+    companyDomain: company.domain || "",
+    hostname: d.hostname || "",
+    countryCode: location.country || "",
+    country: location.country_name || "",
+    isTor: typeof d.is_tor === "boolean" ? d.is_tor : null,
+    raw: d
+  };
+}
+
+function classifyLocal(base, ipinfoLite, abuse, internetData) {
   const combinedText = [
     base.isp,
     base.asn,
     ipinfoLite && ipinfoLite.asn,
     ipinfoLite && ipinfoLite.asName,
     ipinfoLite && ipinfoLite.asDomain,
+    internetData && internetData.asName,
+    internetData && internetData.asDomain,
+    internetData && internetData.companyName,
     abuse && abuse.usageType,
     abuse && abuse.isp,
     abuse && abuse.domain,
@@ -385,12 +440,14 @@ function classifyLocal(base, ipinfoLite, abuse) {
     educationName: hasAny(combinedText, EDUCATION_WORDS),
     corporateName: hasAny(combinedText, CORPORATE_WORDS),
     abuseDatacenterUsage: /data center|datacenter|hosting|web hosting|transit|cdn|commercial/i.test((abuse && abuse.usageType) || ""),
-    abuseTor: Boolean(abuse && abuse.isTor)
+    abuseTor: Boolean(abuse && abuse.isTor),
+    internetDataHosting: Boolean(internetData && internetData.networkType === "hosting"),
+    internetDataTor: Boolean(internetData && internetData.isTor)
   };
 
   let type = "Unknown";
-  if (flags.abuseTor || flags.vpnProxyName) type = "VPN / Proxy / Tor / Privacy Match";
-  else if (flags.abuseDatacenterUsage || flags.knownHostingAsn || flags.hostingName) type = "Hosting / Datacenter";
+  if (flags.abuseTor || flags.internetDataTor || flags.vpnProxyName) type = "VPN / Proxy / Tor / Privacy Match";
+  else if (flags.abuseDatacenterUsage || flags.internetDataHosting || flags.knownHostingAsn || flags.hostingName) type = "Hosting / Datacenter";
   else if (flags.mobileName) type = "Mobile / Cellular";
   else if (flags.residentialName) type = "Likely Residential ISP";
   else if (flags.educationName) type = "Education / Campus";
@@ -466,7 +523,7 @@ function analyzeHeaders(base) {
   return findings;
 }
 
-function buildRiskAnalysis(base, local, ipinfoLite, abuse) {
+function buildRiskAnalysis(base, local, ipinfoLite, abuse, internetData) {
   const findings = [];
   let score = 100;
 
@@ -485,6 +542,18 @@ function buildRiskAnalysis(base, local, ipinfoLite, abuse) {
       message: "AbuseIPDB says this IP is Tor.",
       evidence: {
         isTor: abuse ? abuse.isTor : null
+      }
+    });
+  }
+
+  if (local.flags.internetDataTor && !(local.flags.abuseTor || (abuse && abuse.isTor))) {
+    add({
+      id: "internetdata_tor",
+      severity: "critical",
+      points: 60,
+      message: "InternetData says this IP is Tor.",
+      evidence: {
+        isTor: true
       }
     });
   }
@@ -570,6 +639,25 @@ function buildRiskAnalysis(base, local, ipinfoLite, abuse) {
         asDomain: ipinfoLite.asDomain,
         country: ipinfoLite.country,
         countryCode: ipinfoLite.countryCode
+      }
+    });
+  }
+
+  if (internetData) {
+    add({
+      id: "internetdata_enrichment",
+      severity: "info",
+      points: 0,
+      message: "InternetData: " + (internetData.asn || "Unknown ASN") + " " + (internetData.asName || "") + ", network type " + (internetData.networkType || "Unknown") + ".",
+      evidence: {
+        asn: internetData.asn,
+        asName: internetData.asName,
+        networkType: internetData.networkType,
+        companyName: internetData.companyName,
+        companyDomain: internetData.companyDomain,
+        hostname: internetData.hostname,
+        countryCode: internetData.countryCode,
+        isTor: internetData.isTor
       }
     });
   }
@@ -686,9 +774,9 @@ function buildRiskAnalysis(base, local, ipinfoLite, abuse) {
 
   const tags = [];
 
-  if (local.flags.abuseTor || (abuse && abuse.isTor)) tags.push("Tor");
+  if (local.flags.abuseTor || local.flags.internetDataTor || (abuse && abuse.isTor)) tags.push("Tor");
   if (local.flags.vpnProxyName) tags.push("VPN/Proxy name match");
-  if (local.flags.abuseDatacenterUsage || local.flags.knownHostingAsn || local.flags.hostingName) tags.push("Hosting/Datacenter");
+  if (local.flags.abuseDatacenterUsage || local.flags.internetDataHosting || local.flags.knownHostingAsn || local.flags.hostingName) tags.push("Hosting/Datacenter");
   if (local.flags.mobileName) tags.push("Mobile");
   if (local.flags.residentialName) tags.push("Likely Residential");
   if (local.flags.educationName) tags.push("Education");
@@ -812,16 +900,19 @@ async function buildFullAnalysis(request, env) {
 
   const results = await Promise.all([
     lookupIpinfoLite(base.ip, env),
-    lookupAbuseIpdb(base.ip, env)
+    lookupAbuseIpdb(base.ip, env),
+    lookupInternetData(base.ip, env)
   ]);
 
   const ipinfoRaw = results[0];
   const abuseRaw = results[1];
+  const internetDataRaw = results[2];
 
   const ipinfoLite = parseIpinfoLite(ipinfoRaw);
   const abuse = parseAbuseIpdb(abuseRaw);
-  const local = classifyLocal(base, ipinfoLite, abuse);
-  const risk = buildRiskAnalysis(base, local, ipinfoLite, abuse);
+  const internetData = parseInternetData(internetDataRaw);
+  const local = classifyLocal(base, ipinfoLite, abuse, internetData);
+  const risk = buildRiskAnalysis(base, local, ipinfoLite, abuse, internetData);
 
   return {
     status: "success",
@@ -893,6 +984,13 @@ async function buildFullAnalysis(request, env) {
         parsed: abuse,
         raw: abuseRaw.ok ? abuseRaw.data : null,
         error: abuseRaw.ok ? null : abuseRaw.error
+      },
+      internetdata: {
+        enabled: Boolean(getToken(env, "INTERNETDATA_KEY", MANUAL_INTERNETDATA_KEY)),
+        ok: Boolean(internetDataRaw.ok),
+        parsed: internetData,
+        raw: internetDataRaw.ok ? internetDataRaw.data : null,
+        error: internetDataRaw.ok ? null : internetDataRaw.error
       }
     },
 
@@ -902,6 +1000,7 @@ async function buildFullAnalysis(request, env) {
       datacenterPolicy: "Datacenter/hosting classification is informational only. It does not reduce score by itself.",
       ipinfoLite: "IPinfo Lite does not provide direct is_vpn/is_proxy/is_tor/is_hosting fields. This Worker uses Lite ASN/name/domain enrichment plus heuristics.",
       abuseipdb: "AbuseIPDB is used for reputation, Tor flag, reports, and usageType. UsageType alone does not reduce score.",
+      internetdata: "InternetData is used for ASN, company, network type, hostname, and the Tor flag. Network type alone does not reduce score.",
       realIpBehindVpn: "No website can reliably know the real ISP IP behind a properly configured VPN unless the browser leaks it through WebRTC or another client-side channel.",
       dnsLeak: "A normal Cloudflare Worker cannot see the visitor DNS resolver. Real DNS leak detection needs authoritative DNS logging for unique test subdomains."
     }
@@ -983,8 +1082,10 @@ function renderPage(analysis) {
   const tags = risk.tags && risk.tags.length ? risk.tags : ["No strong tag"];
   const ipinfo = analysis.externalIntel.ipinfoLite;
   const abuse = analysis.externalIntel.abuseipdb;
+  const internetdata = analysis.externalIntel.internetdata;
   const abuseParsed = abuse.parsed || {};
   const ipinfoParsed = ipinfo.parsed || {};
+  const internetdataParsed = internetdata.parsed || {};
   const rawJson = escapeHtml(JSON.stringify(analysis, null, 2));
 
   const findingsHtml = risk.findings.length
@@ -1005,6 +1106,10 @@ function renderPage(analysis) {
 
   const ipinfoStatus = ipinfo.enabled
     ? (ipinfo.ok ? "Connected" : "Error")
+    : "Off";
+
+  const internetdataStatus = internetdata.enabled
+    ? (internetdata.ok ? "Connected" : "Error")
     : "Off";
 
   const scoreCls = scoreClass(risk.score);
@@ -1409,6 +1514,15 @@ pre, .statusbox {
       <div class="metric"><span>AS Name</span><strong>${escapeHtml(ipinfoParsed.asName || "N/A")}</strong></div>
       <div class="metric"><span>Domain</span><strong>${escapeHtml(ipinfoParsed.asDomain || "N/A")}</strong></div>
       <div class="metric"><span>Country</span><strong>${escapeHtml(ipinfoParsed.country || analysis.location.country || "N/A")}</strong></div>
+    </div>
+
+    <div class="card">
+      <div class="label">InternetData</div>
+      <div class="metric"><span>Status</span><strong>${escapeHtml(internetdataStatus)}</strong></div>
+      <div class="metric"><span>ASN</span><strong>${escapeHtml(internetdataParsed.asn || "N/A")}</strong></div>
+      <div class="metric"><span>Company</span><strong>${escapeHtml(internetdataParsed.companyName || "N/A")}</strong></div>
+      <div class="metric"><span>Network Type</span><strong>${escapeHtml(internetdataParsed.networkType || "N/A")}</strong></div>
+      <div class="metric"><span>Tor</span><strong>${escapeHtml(internetdataParsed.isTor === true ? "Yes" : internetdataParsed.isTor === false ? "No" : "N/A")}</strong></div>
     </div>
 
     <div class="card">
